@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit-tests:
+    # windows-latest, not ubuntu, because mssql-server.mjs imports worker.ps1
+    # via a Windows-only PowerShell path and the package.json restricts
+    # `os` to win32. The unit tests themselves only exercise lib/guards.mjs
+    # (pure JS, no SQL Server involved), but running them on the same OS
+    # the tool actually ships on catches accidental platform assumptions.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm test
+
+  # Deliberately no "smoke-test" or "integration" job here: scripts/smoke-check.mjs
+  # needs a real sources.json and a real Windows-integrated SQL Server
+  # connection, neither of which exists in a GitHub-hosted runner. Run
+  # `npm run smoke-test` locally against your own environments instead;
+  # see README.md "Testing".

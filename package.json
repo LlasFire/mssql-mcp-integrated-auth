@@ -4,6 +4,10 @@
   "description": "MCP server for SQL Server, multiple named environments, Windows-integrated (SSO) auth only, no stored credentials.",
   "type": "module",
   "main": "mssql-server.mjs",
+  "scripts": {
+    "test": "node --test test/guards.test.mjs",
+    "smoke-test": "node scripts/smoke-check.mjs"
+  },
   "engines": {
     "node": ">=18"
   },

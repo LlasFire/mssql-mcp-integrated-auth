@@ -10,6 +10,7 @@ import { spawn } from 'child_process';
 import { readFileSync, appendFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { assertReadOnly, clampMaxRows, MAX_ROWS_CEILING } from './lib/guards.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sources = JSON.parse(readFileSync(path.join(__dirname, 'sources.json'), 'utf8'));
@@ -76,40 +77,9 @@ process.on('exit', () => { if (worker) worker.kill(); });
 process.on('SIGINT', () => process.exit(0));
 process.on('SIGTERM', () => process.exit(0));
 
-// --- safety guards ---
-// Heuristic, not a parser: rejects anything with a semicolon before the end
-// (so a stray ';DROP TABLE ...' after a SELECT gets refused), and requires
-// the statement to start with SELECT/WITH with no mutating keyword anywhere.
-// This favors over-rejecting a legitimate query over under-blocking a write.
-function isSingleStatement(sql) {
-  const trimmed = sql.trim().replace(/;\s*$/, '');
-  return !trimmed.includes(';');
-}
-
-function isReadOnly(sql) {
-  const t = sql.trim();
-  return (
-    /^(SELECT|WITH)\b/i.test(t) &&
-    !/\b(INSERT|UPDATE|DELETE|DROP|ALTER|EXEC|EXECUTE|TRUNCATE|MERGE|CREATE|GRANT|REVOKE|DENY)\b/i.test(t)
-  );
-}
-
-function assertReadOnly(sql) {
-  if (!isSingleStatement(sql)) {
-    throw new Error('Only a single SQL statement is allowed (found a semicolon before the end).');
-  }
-  if (!isReadOnly(sql)) {
-    throw new Error('Only read-only SELECT/WITH statements are allowed through this tool.');
-  }
-}
-
-const MAX_ROWS_DEFAULT = 200;
-const MAX_ROWS_CEILING = 2000;
-
-function clampMaxRows(n) {
-  if (!n) return MAX_ROWS_DEFAULT;
-  return Math.min(Math.max(1, n), MAX_ROWS_CEILING);
-}
+// Safety guards (isSingleStatement, isReadOnly, assertReadOnly, clampMaxRows,
+// MAX_ROWS_DEFAULT/MAX_ROWS_CEILING) live in ./lib/guards.mjs so they can be
+// unit-tested (see test/guards.test.mjs) without a live SQL connection.
 
 const server = new McpServer({ name: 'mssql-integrated', version: '2.0.0' });
 const envEnum = z.enum(envIds);

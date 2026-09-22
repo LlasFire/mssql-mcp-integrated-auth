@@ -137,6 +137,44 @@ login/access-denied error from SQL Server means situation 2.
   the SQL text, row count or error, and duration. That file is gitignored;
   treat it as local audit history, not something to commit or share as-is.
 
+## Testing
+
+There are two tiers, because only one of them can run without a real SQL
+Server behind it:
+
+1. **Unit tests (`npm test`)** cover the safety guard logic in
+   `lib/guards.mjs` (`isSingleStatement`, `isReadOnly`, `assertReadOnly`,
+   `clampMaxRows`) with Node's built-in test runner, no extra dependencies,
+   no network, no SQL Server. These run in CI
+   (`.github/workflows/test.yml`, on `windows-latest`) on every push and
+   pull request. This is what actually protects `run_query`: if someone
+   loosens the read-only check, a test should fail before it ships.
+
+2. **Smoke test (`npm run smoke-test`, runs `scripts/smoke-check.mjs`)**
+   is a manual, local, end-to-end check. It spawns the real server,
+   performs the actual MCP `initialize` handshake over stdio (not a
+   shortcut), then calls `list_environments` and `list_databases` against
+   a real environment. Run it yourself after `sources.json` is set up,
+   and again after touching `worker.ps1` or the connection-handling code
+   in `mssql-server.mjs`, since that's the part unit tests can't reach.
+   (It's named `smoke-check.mjs` rather than `smoke-test.mjs` on purpose:
+   Node's test runner auto-discovers any `*-test.mjs` file by default, and
+   this script needs a live SQL Server, so it must never run by accident
+   as part of `npm test` or a bare `node --test`.)
+
+   ```powershell
+   npm run smoke-test
+   npm run smoke-test -- --env dev
+   ```
+
+   It exits non-zero on failure, so it's fine to chain after `npm install`
+   when you just want a quick "does this actually work" check.
+
+What's **not** covered by either tier, and is still worth checking by hand
+after a change: the PowerShell worker's connection-reuse behavior (first
+query slow, repeat queries fast), and the row-cap/`truncated` flag on a
+query that actually returns more rows than the cap.
+
 ## Known limitations
 
 - Named instances resolve via the SQL Server Browser service (UDP 1434).
