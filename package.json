@@ -1,0 +1,17 @@
+{
+  "name": "mssql-mcp-integrated-auth",
+  "version": "1.0.0",
+  "description": "MCP server for SQL Server, multiple named environments, Windows-integrated (SSO) auth only, no stored credentials.",
+  "type": "module",
+  "main": "mssql-server.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "win32"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^3.25.0"
+  }
+}

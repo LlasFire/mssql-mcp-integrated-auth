@@ -1,0 +1,5 @@
+[
+  { "id": "dev",  "host": "sql-dev.example.internal",  "instanceName": "SQLINSTANCE", "database": "master" },
+  { "id": "qa",   "host": "sql-qa.example.internal",   "instanceName": "SQLINSTANCE", "database": "master" },
+  { "id": "prod", "host": "sql-prod.example.internal", "instanceName": "SQLINSTANCE", "database": "master" }
+]
