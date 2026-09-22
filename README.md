@@ -1,5 +1,10 @@
 # mssql-mcp-integrated-auth
 
+**Platform: Windows only.** Not "Windows first" or "Windows tested best":
+this will not run on macOS or Linux at all, on purpose, and there's no
+cross-platform install path planned. See "Why Windows only" below for the
+reason, before you spend time trying to get it running elsewhere.
+
 An MCP server that lets Claude (or any MCP client) query SQL Server across
 multiple named environments (dev, qa, prod, or whatever you call them),
 using Windows-integrated authentication only. There is no username or
@@ -16,6 +21,24 @@ standard .NET way to authenticate with the calling process's own Windows
 identity, and keeps the resulting connections open across calls instead of
 reconnecting every time.
 
+## Why Windows only
+
+`Integrated Security=True` works by handing SQL Server the Windows
+security token of whatever process opened the connection, via SSPI. That
+mechanism only exists on Windows: there's no equivalent "just use the
+identity I'm already logged in as" on macOS or Linux.
+
+The closest Linux/macOS analog is Kerberos: a domain-joined Linux box with
+a valid ticket (`kinit`) can authenticate to SQL Server without a
+password, using `Microsoft.Data.SqlClient` instead of the older
+`System.Data.SqlClient` this project uses, and a rewritten worker in place
+of `worker.ps1` (PowerShell runs on Linux too, but the specific assembly
+and connection-string options this project relies on are Windows-specific).
+That's a real path, but it's a different auth model with its own setup
+burden (domain-joining the Linux box, ticket management), not something
+this repo does today. If your team needs that, it's a separate project
+built on the same idea, not a flag you can flip here.
+
 ## How it works
 
 - `mssql-server.mjs` is the MCP server (stdio transport, built on the
@@ -28,10 +51,13 @@ reconnecting every time.
   optional named instance, and default database. No credentials live here
   either, since there aren't any to store.
 - `lib/guards.mjs` holds the read-only/single-statement safety checks,
-  `lib/sql-identifiers.mjs` holds the SQL-escaping helpers, and
+  `lib/sql-identifiers.mjs` holds the SQL-escaping helpers,
   `lib/schema-queries.mjs` holds the SQL-text builders for every
-  `list_*`/`describe_*` tool. All three are plain, dependency-free
-  functions with their own unit tests (see Testing below), imported by
+  `list_*`/`describe_*` tool, and `lib/json-utils.mjs` strips a stray
+  UTF-8 byte-order mark from `sources.json` before parsing it (Windows
+  PowerShell's default text encoding writes one; Node's `JSON.parse`
+  does not tolerate it). All four are plain, dependency-free functions
+  with their own unit tests (see Testing below), imported by
   `mssql-server.mjs` rather than inlined into the tool handlers.
 
 ## Requirements
@@ -45,7 +71,57 @@ reconnecting every time.
   See "Which account Claude runs as" below, it matters here more than for
   most MCP servers.
 
-## Setup
+## Quick install
+
+For most people this is faster than the manual steps below, and it's the
+same steps, just automated: it doesn't do anything the manual section
+doesn't also describe.
+
+1. Get the code onto your machine: either `git clone <this-repo-url>`, or
+   click Code > Download ZIP on the repo page and extract it somewhere
+   you'll keep it (not Downloads or a temp folder; `claude mcp add` below
+   points at wherever you put it, so moving it later breaks the
+   registration).
+
+   If you downloaded a ZIP: Windows marks files from a downloaded ZIP as
+   coming from the internet ("Mark of the Web"), which can make
+   `setup.cmd` refuse to run or trigger a SmartScreen warning. Fix it in
+   one step before extracting: right-click the `.zip` file itself >
+   Properties > check "Unblock" > OK. That unblocks everything inside it
+   at once.
+
+2. Double-click `setup.cmd` (or run `.\setup.ps1` yourself from
+   PowerShell if you prefer a terminal). It will, in order:
+   - Check that Node.js 18+ and Claude Code are installed, and tell you
+     exactly what's missing and where to get it if not.
+   - Run `npm install` in this folder.
+   - If you don't already have a `sources.json`, ask you for each
+     environment's id, host, optional named instance, and optional
+     default database, one at a time, and write the file for you. If you
+     already have one, it leaves it alone.
+   - Register this server with Claude Code as `mssql`
+     (`claude mcp add mssql -s user -- node "<full path>\mssql-server.mjs"`,
+     with the full path filled in automatically). If a tool named `mssql`
+     is already registered, it stops and tells you rather than
+     overwriting it; run `.\setup.ps1 -McpName my-mssql` to register
+     under a different name instead.
+
+   Want to see exactly what it would do before it touches anything? Run
+   `.\setup.ps1 -DryRun` first.
+
+3. Open a new Claude Code session and ask it to run `list_environments`,
+   then `list_databases` against one environment, to confirm it can
+   actually reach SQL Server. A login/access-denied error there almost
+   always means "Which account Claude runs as" below, not a bug in setup.
+
+`setup.ps1` is plain, readable PowerShell with no external dependencies;
+open it before running it if you want to see exactly what each step
+does, it's the same handful of commands as the manual steps below.
+
+## Manual setup
+
+If you'd rather do each step yourself (or the script doesn't fit your
+situation), here's exactly what it automates:
 
 ```powershell
 git clone <this-repo-url>
@@ -183,11 +259,14 @@ else here.
 There are two tiers, because only one of them can run without a real SQL
 Server behind it:
 
-1. **Unit tests (`npm test`)** run three files with Node's built-in test
+1. **Unit tests (`npm test`)** run four files with Node's built-in test
    runner, no extra dependencies, no network, no SQL Server:
    - `test/guards.test.mjs` covers the safety guard logic in
      `lib/guards.mjs` (`isSingleStatement`, `isReadOnly`, `assertReadOnly`,
      `clampMaxRows`).
+   - `test/json-utils.test.mjs` covers `stripBom()` in
+     `lib/json-utils.mjs`, including the exact BOM-in-`sources.json` case
+     that setup.ps1 (see Quick install) writes around.
    - `test/sql-identifiers.test.mjs` covers the escaping helpers in
      `lib/sql-identifiers.mjs`, including a real SQL-injection string to
      confirm it comes out as one inert literal.
@@ -204,7 +283,8 @@ Server behind it:
 
    `npm test` lists each test file explicitly
    (`node --test test/guards.test.mjs test/sql-identifiers.test.mjs
-   test/schema-queries.test.mjs`) rather than a directory glob, because
+   test/schema-queries.test.mjs test/json-utils.test.mjs`) rather than a
+   directory glob, because
    Node's test runner auto-discovers any file matching `*.test.mjs` or
    `*-test.mjs` on its own; a bare `node --test` would otherwise also
    pick up `scripts/smoke-check.mjs` if it were named `smoke-test.mjs`.

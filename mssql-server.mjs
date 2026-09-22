@@ -27,9 +27,10 @@ import {
   buildDescribeUniqueConstraintsSql,
   buildDescribeCheckConstraintsSql,
 } from './lib/schema-queries.mjs';
+import { stripBom } from './lib/json-utils.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const sources = JSON.parse(readFileSync(path.join(__dirname, 'sources.json'), 'utf8'));
+const sources = JSON.parse(stripBom(readFileSync(path.join(__dirname, 'sources.json'), 'utf8')));
 const envIds = sources.map((s) => s.id);
 const logPath = path.join(__dirname, 'query-log.jsonl');
 
