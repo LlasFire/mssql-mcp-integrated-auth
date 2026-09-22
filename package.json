@@ -5,7 +5,7 @@
   "type": "module",
   "main": "mssql-server.mjs",
   "scripts": {
-    "test": "node --test test/guards.test.mjs",
+    "test": "node --test test/guards.test.mjs test/sql-identifiers.test.mjs test/schema-queries.test.mjs",
     "smoke-test": "node scripts/smoke-check.mjs"
   },
   "engines": {

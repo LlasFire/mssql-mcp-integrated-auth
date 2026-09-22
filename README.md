@@ -27,6 +27,12 @@ reconnecting every time.
 - `sources.json` (not committed, see setup) lists your environments: host,
   optional named instance, and default database. No credentials live here
   either, since there aren't any to store.
+- `lib/guards.mjs` holds the read-only/single-statement safety checks,
+  `lib/sql-identifiers.mjs` holds the SQL-escaping helpers, and
+  `lib/schema-queries.mjs` holds the SQL-text builders for every
+  `list_*`/`describe_*` tool. All three are plain, dependency-free
+  functions with their own unit tests (see Testing below), imported by
+  `mssql-server.mjs` rather than inlined into the tool handlers.
 
 ## Requirements
 
@@ -108,13 +114,37 @@ login/access-denied error from SQL Server means situation 2.
 
 ## Tools
 
+Three groups: list objects, inspect one object deeply, or run your own
+read-only query once you know the shape of the data.
+
 | Tool | Arguments | Notes |
 |---|---|---|
 | `list_environments` | none | Lists the environments from `sources.json`. |
 | `list_databases` | `env` | Databases visible on that environment. |
-| `list_tables` | `env`, `database?`, `schema?` | From `INFORMATION_SCHEMA.TABLES`. |
-| `describe_table` | `env`, `table`, `database?`, `schema?` | Columns, types, nullability, from `INFORMATION_SCHEMA.COLUMNS`. |
-| `run_query` | `env`, `sql`, `database?`, `maxRows?` | Read-only only, see below. |
+| `list_tables` | `env`, `database?`, `schema?` | Base tables only (`TABLE_TYPE = 'BASE TABLE'`). Views are excluded on purpose; use `list_views`. |
+| `list_views` | `env`, `database?`, `schema?` | Views only, from `INFORMATION_SCHEMA.VIEWS`. |
+| `list_stored_procedures` | `env`, `database?`, `schema?` | Names only, from `INFORMATION_SCHEMA.ROUTINES`. |
+| `list_functions` | `env`, `database?`, `schema?` | Scalar, inline table-valued, and multi-statement table-valued functions, with return type. |
+| `list_triggers` | `env`, `database?`, `table?` | DML triggers on tables only (not database/server-level triggers). Shows which table, INSTEAD OF vs AFTER, and enabled/disabled. |
+| `describe_table` | `env`, `table`, `database?`, `schema?` | Columns, primary key, foreign keys (with the referenced table/column), unique constraints, and check constraints. |
+| `describe_procedure` | `env`, `name`, `database?`, `schema?` | Parameters and the full `CREATE PROCEDURE` body. |
+| `describe_function` | `env`, `name`, `database?`, `schema?` | Parameters and the full `CREATE FUNCTION` body. |
+| `describe_trigger` | `env`, `trigger`, `database?` | The full trigger body, its table, and INSTEAD OF/disabled flags. |
+| `run_query` | `env`, `sql`, `database?`, `maxRows?` | Ad hoc read-only queries. Write the T-SQL yourself once the tools above have told you what's there; see Safety below. |
+
+`describe_procedure` and `describe_function` come back with an empty
+`definition` field if the object is encrypted (`WITH ENCRYPTION`) or you
+lack `VIEW DEFINITION` permission on it. That's SQL Server withholding the
+text, not a bug in this tool.
+
+Note on scope: schema discovery (the `list_*` tools), deep inspection (the
+`describe_*` tools), and ad hoc querying (`run_query`) are kept as three
+separate concerns on purpose. There's no single tool that writes,
+explains, and runs a query for you; instead, the `list_*`/`describe_*`
+tools give an MCP client (Claude, or anything else) enough context about
+the real schema to write correct T-SQL itself, and `run_query` is what
+actually executes it, read-only, with the same safety rules as everything
+else here.
 
 ## Safety
 
@@ -124,12 +154,23 @@ login/access-denied error from SQL Server means situation 2.
   `TRUNCATE`, `MERGE`, `CREATE`, `GRANT`, `REVOKE`, `DENY`) anywhere in the
   text, gets rejected before it reaches SQL Server.
 - This is a keyword/shape heuristic, not a SQL parser. It deliberately
-  fails toward over-rejecting: a legitimate query containing one of those
-  words inside a string literal (e.g. `WHERE Notes LIKE '%dropped%'`) will
-  also get rejected. If you need real write access or need to relax this,
-  do it deliberately by editing `assertReadOnly()` in `mssql-server.mjs`,
-  and prefer granting a read-only SQL/Windows login on the server side
-  over loosening this check.
+  fails toward over-rejecting: the keyword check matches on word
+  boundaries, so `LIKE '%dropped%'` is fine (`drop` isn't a whole word
+  there), but a mutating keyword that *is* a whole word inside a string
+  literal, e.g. `WHERE Notes LIKE '%please delete this%'`, still gets
+  rejected. If you need real write access or need to relax this, do it
+  deliberately by editing `assertReadOnly()` in `lib/guards.mjs`, and
+  prefer granting a read-only SQL/Windows login on the server side over
+  loosening this check.
+- Every `list_*`/`describe_*` tool builds its SQL by interpolating your
+  arguments (a schema, table, or procedure name) into a query string,
+  since the PowerShell worker executes a full T-SQL batch by text and has
+  no real parameter binding. Those values all go through
+  `sqlLiteral()`/`optionalEqualsClause()` in `lib/sql-identifiers.mjs`
+  first, which is the one place that escapes embedded quotes so a name
+  like `Orders'; DROP TABLE Orders; --` can't break out of the string it's
+  placed in. See `test/sql-identifiers.test.mjs` for the exact injection
+  case this defends against.
 - Results are capped at 200 rows by default, 2000 rows maximum
   (`maxRows` argument), with a `truncated` flag in the response.
 - Every `run_query` call (success or failure) is appended to
@@ -142,13 +183,32 @@ login/access-denied error from SQL Server means situation 2.
 There are two tiers, because only one of them can run without a real SQL
 Server behind it:
 
-1. **Unit tests (`npm test`)** cover the safety guard logic in
-   `lib/guards.mjs` (`isSingleStatement`, `isReadOnly`, `assertReadOnly`,
-   `clampMaxRows`) with Node's built-in test runner, no extra dependencies,
-   no network, no SQL Server. These run in CI
-   (`.github/workflows/test.yml`, on `windows-latest`) on every push and
-   pull request. This is what actually protects `run_query`: if someone
-   loosens the read-only check, a test should fail before it ships.
+1. **Unit tests (`npm test`)** run three files with Node's built-in test
+   runner, no extra dependencies, no network, no SQL Server:
+   - `test/guards.test.mjs` covers the safety guard logic in
+     `lib/guards.mjs` (`isSingleStatement`, `isReadOnly`, `assertReadOnly`,
+     `clampMaxRows`).
+   - `test/sql-identifiers.test.mjs` covers the escaping helpers in
+     `lib/sql-identifiers.mjs`, including a real SQL-injection string to
+     confirm it comes out as one inert literal.
+   - `test/schema-queries.test.mjs` covers every SQL-text builder in
+     `lib/schema-queries.mjs` (the `list_*`/`describe_*` tools): that
+     optional filters are appended correctly, that `list_tables` actually
+     excludes views now, and that a malicious schema/table/procedure name
+     comes out escaped in the generated SQL rather than raw.
+
+   These run in CI (`.github/workflows/test.yml`, on `windows-latest`) on
+   every push and pull request. This is what actually protects
+   `run_query` and the schema tools: if someone loosens the read-only
+   check or drops the escaping, a test should fail before it ships.
+
+   `npm test` lists each test file explicitly
+   (`node --test test/guards.test.mjs test/sql-identifiers.test.mjs
+   test/schema-queries.test.mjs`) rather than a directory glob, because
+   Node's test runner auto-discovers any file matching `*.test.mjs` or
+   `*-test.mjs` on its own; a bare `node --test` would otherwise also
+   pick up `scripts/smoke-check.mjs` if it were named `smoke-test.mjs`.
+   If you add a new test file under `test/`, add it to this script too.
 
 2. **Smoke test (`npm run smoke-test`, runs `scripts/smoke-check.mjs`)**
    is a manual, local, end-to-end check. It spawns the real server,

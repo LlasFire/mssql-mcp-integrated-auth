@@ -11,6 +11,22 @@ import { readFileSync, appendFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { assertReadOnly, clampMaxRows, MAX_ROWS_CEILING } from './lib/guards.mjs';
+import {
+  buildListTablesSql,
+  buildListViewsSql,
+  buildListStoredProceduresSql,
+  buildListFunctionsSql,
+  buildListTriggersSql,
+  buildDescribeParametersSql,
+  buildDescribeProcedureDefinitionSql,
+  buildDescribeFunctionDefinitionSql,
+  buildDescribeTriggerSql,
+  buildDescribeColumnsSql,
+  buildDescribePrimaryKeySql,
+  buildDescribeForeignKeysSql,
+  buildDescribeUniqueConstraintsSql,
+  buildDescribeCheckConstraintsSql,
+} from './lib/schema-queries.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sources = JSON.parse(readFileSync(path.join(__dirname, 'sources.json'), 'utf8'));
@@ -112,14 +128,75 @@ server.registerTool(
 server.registerTool(
   'list_tables',
   {
-    description: 'List tables in a database on a given environment.',
+    description: 'List base tables (not views) in a database on a given environment, optionally ' +
+      'filtered to one schema. Returns schema/table name pairs only, no columns. Use list_views for ' +
+      'views, or describe_table for one table\'s columns and constraints.',
     inputSchema: { env: envEnum, database: z.string().optional(), schema: z.string().optional() },
   },
   async ({ env, database, schema }) => {
-    const sql = schema
-      ? `SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = '${schema.replace(/'/g, "''")}' ORDER BY TABLE_NAME`
-      : `SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_SCHEMA, TABLE_NAME`;
-    const result = await callWorker({ env, database, sql, maxRows: MAX_ROWS_CEILING });
+    const result = await callWorker({ env, database, sql: buildListTablesSql(schema), maxRows: MAX_ROWS_CEILING });
+    if (!result.ok) throw new Error(result.error);
+    return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  'list_views',
+  {
+    description: 'List views (not base tables) in a database on a given environment, optionally ' +
+      'filtered to one schema. Returns schema/view name pairs only, not their definitions.',
+    inputSchema: { env: envEnum, database: z.string().optional(), schema: z.string().optional() },
+  },
+  async ({ env, database, schema }) => {
+    const result = await callWorker({ env, database, sql: buildListViewsSql(schema), maxRows: MAX_ROWS_CEILING });
+    if (!result.ok) throw new Error(result.error);
+    return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  'list_stored_procedures',
+  {
+    description: 'List stored procedures in a database on a given environment, optionally filtered ' +
+      'to one schema. Returns schema/procedure name pairs only, not their parameters or body; use ' +
+      'describe_procedure for that.',
+    inputSchema: { env: envEnum, database: z.string().optional(), schema: z.string().optional() },
+  },
+  async ({ env, database, schema }) => {
+    const result = await callWorker({ env, database, sql: buildListStoredProceduresSql(schema), maxRows: MAX_ROWS_CEILING });
+    if (!result.ok) throw new Error(result.error);
+    return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  'list_functions',
+  {
+    description: 'List user-defined functions (scalar, inline table-valued, and multi-statement ' +
+      'table-valued) in a database on a given environment, optionally filtered to one schema. ' +
+      'Returns schema/function name/return-type only, not their parameters or body; use ' +
+      'describe_function for that.',
+    inputSchema: { env: envEnum, database: z.string().optional(), schema: z.string().optional() },
+  },
+  async ({ env, database, schema }) => {
+    const result = await callWorker({ env, database, sql: buildListFunctionsSql(schema), maxRows: MAX_ROWS_CEILING });
+    if (!result.ok) throw new Error(result.error);
+    return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  'list_triggers',
+  {
+    description: 'List DML triggers (AFTER or INSTEAD OF triggers on INSERT/UPDATE/DELETE against a ' +
+      'table) in a database on a given environment, optionally filtered to one table. For each ' +
+      'trigger, returns which table it is on, whether it is an INSTEAD OF trigger, and whether it is ' +
+      'currently disabled. Does not return trigger bodies (use describe_trigger for that) and does ' +
+      'not include database-level or server-level triggers, only ordinary table triggers.',
+    inputSchema: { env: envEnum, database: z.string().optional(), table: z.string().optional() },
+  },
+  async ({ env, database, table }) => {
+    const result = await callWorker({ env, database, sql: buildListTriggersSql(table), maxRows: MAX_ROWS_CEILING });
     if (!result.ok) throw new Error(result.error);
     return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
   }
@@ -128,17 +205,109 @@ server.registerTool(
 server.registerTool(
   'describe_table',
   {
-    description: 'List columns, types, and nullability for a table.',
+    description: 'Deep inspection of one table: columns (name, data type, nullability, max length), ' +
+      'its primary key, its foreign keys (with the referenced schema/table/column), its unique ' +
+      'constraints, and its check constraints. This is a schema inspection tool: it never returns ' +
+      'row data, only structure. Throws if the table does not exist or is not visible.',
     inputSchema: { env: envEnum, table: z.string(), database: z.string().optional(), schema: z.string().optional() },
   },
   async ({ env, table, database, schema }) => {
-    const schemaFilter = schema ? ` AND TABLE_SCHEMA = '${schema.replace(/'/g, "''")}'` : '';
-    const sql = `SELECT TABLE_SCHEMA, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, CHARACTER_MAXIMUM_LENGTH ` +
-      `FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '${table.replace(/'/g, "''")}'${schemaFilter} ORDER BY ORDINAL_POSITION`;
-    const result = await callWorker({ env, database, sql, maxRows: MAX_ROWS_CEILING });
+    const columnsResult = await callWorker({ env, database, sql: buildDescribeColumnsSql(table, schema), maxRows: MAX_ROWS_CEILING });
+    if (!columnsResult.ok) throw new Error(columnsResult.error);
+    if (columnsResult.rows.length === 0) {
+      throw new Error(`Table '${table}' not found (or no columns visible) in that database.`);
+    }
+    const pkResult = await callWorker({ env, database, sql: buildDescribePrimaryKeySql(table, schema), maxRows: MAX_ROWS_CEILING });
+    if (!pkResult.ok) throw new Error(pkResult.error);
+    const fkResult = await callWorker({ env, database, sql: buildDescribeForeignKeysSql(table, schema), maxRows: MAX_ROWS_CEILING });
+    if (!fkResult.ok) throw new Error(fkResult.error);
+    const uniqueResult = await callWorker({ env, database, sql: buildDescribeUniqueConstraintsSql(table, schema), maxRows: MAX_ROWS_CEILING });
+    if (!uniqueResult.ok) throw new Error(uniqueResult.error);
+    const checkResult = await callWorker({ env, database, sql: buildDescribeCheckConstraintsSql(table, schema), maxRows: MAX_ROWS_CEILING });
+    if (!checkResult.ok) throw new Error(checkResult.error);
+    const body = {
+      columns: columnsResult.rows,
+      primaryKey: pkResult.rows.map((r) => r.COLUMN_NAME),
+      foreignKeys: fkResult.rows,
+      uniqueConstraints: uniqueResult.rows,
+      checkConstraints: checkResult.rows,
+    };
+    return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  'describe_procedure',
+  {
+    description: 'Deep inspection of one stored procedure: its parameters (name, data type, and ' +
+      'whether each is IN or OUT/INOUT) and its full T-SQL definition (the CREATE PROCEDURE body), ' +
+      'so you can read exactly what it does before deciding whether to run it. The definition field ' +
+      'comes back empty if the procedure is encrypted (WITH ENCRYPTION) or you lack VIEW DEFINITION ' +
+      'permission on it; that is a SQL Server restriction, not a bug in this tool. Throws if no ' +
+      'procedure with that name is visible.',
+    inputSchema: { env: envEnum, name: z.string(), database: z.string().optional(), schema: z.string().optional() },
+  },
+  async ({ env, name, database, schema }) => {
+    const paramsResult = await callWorker({ env, database, sql: buildDescribeParametersSql(name, schema), maxRows: MAX_ROWS_CEILING });
+    if (!paramsResult.ok) throw new Error(paramsResult.error);
+    const defResult = await callWorker({ env, database, sql: buildDescribeProcedureDefinitionSql(name, schema), maxRows: 1 });
+    if (!defResult.ok) throw new Error(defResult.error);
+    if (defResult.rows.length === 0) {
+      throw new Error(`Stored procedure '${name}' not found (or not visible) in that database.`);
+    }
+    const body = {
+      schema: defResult.rows[0].TABLE_SCHEMA,
+      parameters: paramsResult.rows,
+      definition: defResult.rows[0].DEFINITION,
+    };
+    return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  'describe_function',
+  {
+    description: 'Deep inspection of one user-defined function (scalar, inline table-valued, or ' +
+      'multi-statement table-valued): its parameters and its full T-SQL definition (the CREATE ' +
+      'FUNCTION body). Same encryption/permission caveat as describe_procedure: the definition field ' +
+      'comes back empty if it is encrypted or not visible to you. Throws if no function with that ' +
+      'name is visible.',
+    inputSchema: { env: envEnum, name: z.string(), database: z.string().optional(), schema: z.string().optional() },
+  },
+  async ({ env, name, database, schema }) => {
+    const paramsResult = await callWorker({ env, database, sql: buildDescribeParametersSql(name, schema), maxRows: MAX_ROWS_CEILING });
+    if (!paramsResult.ok) throw new Error(paramsResult.error);
+    const defResult = await callWorker({ env, database, sql: buildDescribeFunctionDefinitionSql(name, schema), maxRows: 1 });
+    if (!defResult.ok) throw new Error(defResult.error);
+    if (defResult.rows.length === 0) {
+      throw new Error(`Function '${name}' not found (or not visible) in that database.`);
+    }
+    const body = {
+      schema: defResult.rows[0].TABLE_SCHEMA,
+      parameters: paramsResult.rows,
+      definition: defResult.rows[0].DEFINITION,
+    };
+    return { content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  'describe_trigger',
+  {
+    description: 'Deep inspection of one DML trigger: its full T-SQL definition, which table it is ' +
+      'attached to, whether it fires INSTEAD OF the triggering statement (vs. AFTER), and whether it ' +
+      'is currently disabled. The specific INSERT/UPDATE/DELETE events it fires on are visible in the ' +
+      'definition text itself (the trigger\'s FOR/AFTER clause), not returned as separate fields. ' +
+      'Throws if no table trigger with that name is visible.',
+    inputSchema: { env: envEnum, trigger: z.string(), database: z.string().optional() },
+  },
+  async ({ env, trigger, database }) => {
+    const result = await callWorker({ env, database, sql: buildDescribeTriggerSql(trigger), maxRows: 1 });
     if (!result.ok) throw new Error(result.error);
-    if (result.rows.length === 0) throw new Error(`Table '${table}' not found (or no columns visible) in that database.`);
-    return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] };
+    if (result.rows.length === 0) {
+      throw new Error(`Trigger '${trigger}' not found (or not visible) in that database.`);
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(result.rows[0], null, 2) }] };
   }
 );
 
@@ -146,7 +315,10 @@ server.registerTool(
   'run_query',
   {
     description: 'Run a single read-only (SELECT/WITH) SQL query against an environment and database. ' +
-      'Writes and multi-statement batches are blocked. Results are capped (default 200 rows, max 2000).',
+      'This is the tool for ad hoc, exploratory queries once you know the shape of the data, e.g. ' +
+      'from list_tables/describe_table/list_stored_procedures/etc.: write the T-SQL yourself and run ' +
+      'it here. Writes and multi-statement batches are blocked. Results are capped (default 200 ' +
+      'rows, max 2000).',
     inputSchema: {
       env: envEnum,
       sql: z.string(),
