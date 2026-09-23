@@ -59,6 +59,15 @@ built on the same idea, not a flag you can flip here.
   does not tolerate it). All four are plain, dependency-free functions
   with their own unit tests (see Testing below), imported by
   `mssql-server.mjs` rather than inlined into the tool handlers.
+- `.claude/skills/mssql-mcp-integrated-auth/SKILL.md` is a Claude Code
+  skill that teaches Claude how to *use* these tools well: the right
+  discovery order (don't guess a table/column name, look it up), the
+  pattern for comparing a value across environments, and how to read
+  this server's specific errors. Claude Code auto-loads project skills
+  from `.claude/skills/` whenever it's run with this repo folder open,
+  so teammates get this for free just by cloning the repo, no separate
+  install step. See "Which account Claude runs as" below for the
+  troubleshooting angle the skill leans on.
 
 ## Requirements
 
