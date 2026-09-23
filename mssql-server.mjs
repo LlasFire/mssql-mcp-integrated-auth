@@ -28,11 +28,21 @@ import {
   buildDescribeCheckConstraintsSql,
 } from './lib/schema-queries.mjs';
 import { stripBom } from './lib/json-utils.mjs';
+import { assertSafeIdentifier } from './lib/sql-identifiers.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sources = JSON.parse(stripBom(readFileSync(path.join(__dirname, 'sources.json'), 'utf8')));
 const envIds = sources.map((s) => s.id);
 const logPath = path.join(__dirname, 'query-log.jsonl');
+
+// `database` is never embedded in SQL text; it goes into the connection
+// string worker.ps1 builds, so a stray ';' in it can inject connection
+// properties (see assertSafeIdentifier). Reject that shape at the MCP
+// boundary instead of only in the worker.
+const databaseSchema = z.string().refine(
+  (v) => { try { assertSafeIdentifier(v, 'database'); return true; } catch { return false; } },
+  { message: 'database must be a plain SQL Server identifier (letters, digits, or _ $ # @)' }
+).optional();
 
 function log(entry) {
   try {
@@ -101,6 +111,40 @@ process.on('SIGTERM', () => process.exit(0));
 const server = new McpServer({ name: 'mssql-integrated', version: '2.0.0' });
 const envEnum = z.enum(envIds);
 
+// The Claude Code skill at .claude/skills/mssql-mcp-integrated-auth/SKILL.md
+// (discovery order, cross-env comparison, safety rules, error troubleshooting)
+// previously only reached Claude by living in the same repo as this server -
+// no relationship an MCP client could see. Serving it as an MCP resource
+// means any client, not just Claude Code with this repo checked out, can
+// fetch the same usage guide straight from the server.
+const SKILL_PATH = path.join(__dirname, '.claude', 'skills', 'mssql-mcp-integrated-auth', 'SKILL.md');
+
+// Strips the skill file's YAML frontmatter (name/description for Claude
+// Code's own skill loader) so the resource serves just the usage guide.
+function stripFrontmatter(md) {
+  return md.replace(/^---\n[\s\S]*?\n---\n/, '');
+}
+
+server.registerResource(
+  'usage-guide',
+  'mssql-integrated://usage-guide',
+  {
+    title: 'mssql-integrated usage guide',
+    description: 'Discovery order, cross-environment comparison, safety rules, and error ' +
+      'troubleshooting for this server\'s tools. Read this before writing ad hoc SQL.',
+    mimeType: 'text/markdown',
+  },
+  async (uri) => {
+    let text;
+    try {
+      text = stripFrontmatter(readFileSync(SKILL_PATH, 'utf8'));
+    } catch {
+      throw new Error(`Usage guide not found at ${SKILL_PATH}.`);
+    }
+    return { contents: [{ uri: uri.href, mimeType: 'text/markdown', text }] };
+  }
+);
+
 server.registerTool(
   'list_environments',
   { description: 'List the configured SQL Server environments and their host/instance.' },
@@ -132,7 +176,7 @@ server.registerTool(
     description: 'List base tables (not views) in a database on a given environment, optionally ' +
       'filtered to one schema. Returns schema/table name pairs only, no columns. Use list_views for ' +
       'views, or describe_table for one table\'s columns and constraints.',
-    inputSchema: { env: envEnum, database: z.string().optional(), schema: z.string().optional() },
+    inputSchema: { env: envEnum, database: databaseSchema, schema: z.string().optional() },
   },
   async ({ env, database, schema }) => {
     const result = await callWorker({ env, database, sql: buildListTablesSql(schema), maxRows: MAX_ROWS_CEILING });
@@ -146,7 +190,7 @@ server.registerTool(
   {
     description: 'List views (not base tables) in a database on a given environment, optionally ' +
       'filtered to one schema. Returns schema/view name pairs only, not their definitions.',
-    inputSchema: { env: envEnum, database: z.string().optional(), schema: z.string().optional() },
+    inputSchema: { env: envEnum, database: databaseSchema, schema: z.string().optional() },
   },
   async ({ env, database, schema }) => {
     const result = await callWorker({ env, database, sql: buildListViewsSql(schema), maxRows: MAX_ROWS_CEILING });
@@ -161,7 +205,7 @@ server.registerTool(
     description: 'List stored procedures in a database on a given environment, optionally filtered ' +
       'to one schema. Returns schema/procedure name pairs only, not their parameters or body; use ' +
       'describe_procedure for that.',
-    inputSchema: { env: envEnum, database: z.string().optional(), schema: z.string().optional() },
+    inputSchema: { env: envEnum, database: databaseSchema, schema: z.string().optional() },
   },
   async ({ env, database, schema }) => {
     const result = await callWorker({ env, database, sql: buildListStoredProceduresSql(schema), maxRows: MAX_ROWS_CEILING });
@@ -177,7 +221,7 @@ server.registerTool(
       'table-valued) in a database on a given environment, optionally filtered to one schema. ' +
       'Returns schema/function name/return-type only, not their parameters or body; use ' +
       'describe_function for that.',
-    inputSchema: { env: envEnum, database: z.string().optional(), schema: z.string().optional() },
+    inputSchema: { env: envEnum, database: databaseSchema, schema: z.string().optional() },
   },
   async ({ env, database, schema }) => {
     const result = await callWorker({ env, database, sql: buildListFunctionsSql(schema), maxRows: MAX_ROWS_CEILING });
@@ -194,7 +238,7 @@ server.registerTool(
       'trigger, returns which table it is on, whether it is an INSTEAD OF trigger, and whether it is ' +
       'currently disabled. Does not return trigger bodies (use describe_trigger for that) and does ' +
       'not include database-level or server-level triggers, only ordinary table triggers.',
-    inputSchema: { env: envEnum, database: z.string().optional(), table: z.string().optional() },
+    inputSchema: { env: envEnum, database: databaseSchema, table: z.string().optional() },
   },
   async ({ env, database, table }) => {
     const result = await callWorker({ env, database, sql: buildListTriggersSql(table), maxRows: MAX_ROWS_CEILING });
@@ -210,7 +254,7 @@ server.registerTool(
       'its primary key, its foreign keys (with the referenced schema/table/column), its unique ' +
       'constraints, and its check constraints. This is a schema inspection tool: it never returns ' +
       'row data, only structure. Throws if the table does not exist or is not visible.',
-    inputSchema: { env: envEnum, table: z.string(), database: z.string().optional(), schema: z.string().optional() },
+    inputSchema: { env: envEnum, table: z.string(), database: databaseSchema, schema: z.string().optional() },
   },
   async ({ env, table, database, schema }) => {
     const columnsResult = await callWorker({ env, database, sql: buildDescribeColumnsSql(table, schema), maxRows: MAX_ROWS_CEILING });
@@ -246,7 +290,7 @@ server.registerTool(
       'comes back empty if the procedure is encrypted (WITH ENCRYPTION) or you lack VIEW DEFINITION ' +
       'permission on it; that is a SQL Server restriction, not a bug in this tool. Throws if no ' +
       'procedure with that name is visible.',
-    inputSchema: { env: envEnum, name: z.string(), database: z.string().optional(), schema: z.string().optional() },
+    inputSchema: { env: envEnum, name: z.string(), database: databaseSchema, schema: z.string().optional() },
   },
   async ({ env, name, database, schema }) => {
     const paramsResult = await callWorker({ env, database, sql: buildDescribeParametersSql(name, schema), maxRows: MAX_ROWS_CEILING });
@@ -273,7 +317,7 @@ server.registerTool(
       'FUNCTION body). Same encryption/permission caveat as describe_procedure: the definition field ' +
       'comes back empty if it is encrypted or not visible to you. Throws if no function with that ' +
       'name is visible.',
-    inputSchema: { env: envEnum, name: z.string(), database: z.string().optional(), schema: z.string().optional() },
+    inputSchema: { env: envEnum, name: z.string(), database: databaseSchema, schema: z.string().optional() },
   },
   async ({ env, name, database, schema }) => {
     const paramsResult = await callWorker({ env, database, sql: buildDescribeParametersSql(name, schema), maxRows: MAX_ROWS_CEILING });
@@ -300,7 +344,7 @@ server.registerTool(
       'is currently disabled. The specific INSERT/UPDATE/DELETE events it fires on are visible in the ' +
       'definition text itself (the trigger\'s FOR/AFTER clause), not returned as separate fields. ' +
       'Throws if no table trigger with that name is visible.',
-    inputSchema: { env: envEnum, trigger: z.string(), database: z.string().optional() },
+    inputSchema: { env: envEnum, trigger: z.string(), database: databaseSchema },
   },
   async ({ env, trigger, database }) => {
     const result = await callWorker({ env, database, sql: buildDescribeTriggerSql(trigger), maxRows: 1 });
@@ -323,7 +367,7 @@ server.registerTool(
     inputSchema: {
       env: envEnum,
       sql: z.string(),
-      database: z.string().optional(),
+      database: databaseSchema,
       maxRows: z.number().int().positive().optional(),
     },
   },

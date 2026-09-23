@@ -12,9 +12,9 @@
 //   npm run smoke-test -- --env dev
 //
 // It spawns the real server over stdio, does the MCP initialize handshake
-// by hand (no test-only shortcuts), then calls list_environments and, for
-// one environment, list_databases. It prints what it finds and exits
-// non-zero on any failure.
+// by hand (no test-only shortcuts), checks the usage-guide resource, then
+// calls list_environments and, for one environment, list_databases. It
+// prints what it finds and exits non-zero on any failure.
 
 import { spawn } from 'child_process';
 import path from 'path';
@@ -101,6 +101,16 @@ async function main() {
       clientInfo: { name: 'smoke-test', version: '1.0.0' },
     });
     client.notify('notifications/initialized', {});
+
+    console.log('\nListing resources...');
+    const resourceList = await client.send('resources/list', {});
+    const guide = resourceList.resources?.find((r) => r.uri === 'mssql-integrated://usage-guide');
+    if (!guide) throw new Error('usage-guide resource not advertised by resources/list.');
+    const guideRead = await client.send('resources/read', { uri: guide.uri });
+    if (!guideRead.contents?.[0]?.text?.includes('Discovery order')) {
+      throw new Error('usage-guide resource content looks wrong (missing expected heading).');
+    }
+    console.log(`Usage guide resource OK (${guideRead.contents[0].text.length} chars).`);
 
     console.log('\nCalling list_environments...');
     const envResult = await callTool(client, 'list_environments');

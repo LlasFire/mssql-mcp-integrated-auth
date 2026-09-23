@@ -222,6 +222,12 @@ read-only query once you know the shape of the data.
 lack `VIEW DEFINITION` permission on it. That's SQL Server withholding the
 text, not a bug in this tool.
 
+## Resources
+
+| Resource | URI | Notes |
+|---|---|---|
+| Usage guide | `mssql-integrated://usage-guide` | Discovery order, cross-environment comparison, safety rules, and error troubleshooting - the same content as `.claude/skills/mssql-mcp-integrated-auth/SKILL.md` (minus its Claude Code frontmatter), served over MCP so any client can fetch it, not just Claude Code with this repo checked out. |
+
 Note on scope: schema discovery (the `list_*` tools), deep inspection (the
 `describe_*` tools), and ad hoc querying (`run_query`) are kept as three
 separate concerns on purpose. There's no single tool that writes,
@@ -237,16 +243,19 @@ else here.
   with a semicolon before the end (a batched second statement), or any
   mutating keyword (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `EXEC`,
   `TRUNCATE`, `MERGE`, `CREATE`, `GRANT`, `REVOKE`, `DENY`) anywhere in the
-  text, gets rejected before it reaches SQL Server.
-- This is a keyword/shape heuristic, not a SQL parser. It deliberately
-  fails toward over-rejecting: the keyword check matches on word
-  boundaries, so `LIKE '%dropped%'` is fine (`drop` isn't a whole word
-  there), but a mutating keyword that *is* a whole word inside a string
-  literal, e.g. `WHERE Notes LIKE '%please delete this%'`, still gets
-  rejected. If you need real write access or need to relax this, do it
-  deliberately by editing `assertReadOnly()` in `lib/guards.mjs`, and
-  prefer granting a read-only SQL/Windows login on the server side over
-  loosening this check.
+  text, gets rejected before it reaches SQL Server. `OPENROWSET`,
+  `OPENQUERY`, and `OPENDATASOURCE` are blocked too: syntactically they're
+  just a `SELECT`, but they let a "read-only" query read arbitrary files
+  off the SQL Server host (`OPENROWSET(BULK ...)`) or run anything on a
+  linked server (`OPENQUERY`), which defeats the point of this check.
+- This is a keyword/shape heuristic, not a SQL parser, and it blanks out
+  string literals before scanning for those keywords, so a mutating word
+  that's a whole word but *inside* a value, e.g.
+  `WHERE Notes LIKE '%please delete this%'`, is correctly left alone - it's
+  only a real keyword outside quotes that trips the check. If you need
+  real write access or need to relax this, do it deliberately by editing
+  `assertReadOnly()` in `lib/guards.mjs`, and prefer granting a read-only
+  SQL/Windows login on the server side over loosening this check.
 - Every `list_*`/`describe_*` tool builds its SQL by interpolating your
   arguments (a schema, table, or procedure name) into a query string,
   since the PowerShell worker executes a full T-SQL batch by text and has
@@ -256,6 +265,17 @@ else here.
   like `Orders'; DROP TABLE Orders; --` can't break out of the string it's
   placed in. See `test/sql-identifiers.test.mjs` for the exact injection
   case this defends against.
+- The `database` argument accepted by every tool is different: it's never
+  embedded in SQL text, it goes straight into the connection string
+  `worker.ps1` builds for `SqlConnection`
+  (`Server=...;Database=<value>;Integrated Security=True;...`). A value
+  like `master;Server=attacker,1433` there would override the `Server=`
+  key and redirect the whole Windows-integrated auth handshake to an
+  arbitrary host - `sqlLiteral()` escaping doesn't help here since the
+  risk is connection-string keys, not a SQL string literal. So `database`
+  is instead restricted to a plain identifier (`assertSafeIdentifier()` in
+  `lib/sql-identifiers.mjs`, letters/digits/`_$#@` only), enforced both in
+  `mssql-server.mjs`'s zod schema and again in `worker.ps1` itself.
 - Results are capped at 200 rows by default, 2000 rows maximum
   (`maxRows` argument), with a `truncated` flag in the response.
 - Every `run_query` call (success or failure) is appended to

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { escapeSqlLiteral, sqlLiteral, optionalEqualsClause } from '../lib/sql-identifiers.mjs';
+import { escapeSqlLiteral, sqlLiteral, optionalEqualsClause, assertSafeIdentifier } from '../lib/sql-identifiers.mjs';
 
 // --- escapeSqlLiteral -------------------------------------------------------
 
@@ -74,4 +74,26 @@ test('optionalEqualsClause: escapes quotes in the value, not just sqlLiteral in 
     optionalEqualsClause('TABLE_SCHEMA', "weird'schema"),
     " AND TABLE_SCHEMA = 'weird''schema'"
   );
+});
+
+// --- assertSafeIdentifier -----------------------------------------------------
+// A database name goes straight into worker.ps1's connection string, not into
+// SQL text, so it can't be neutralized with quote-doubling like the values
+// above - it must be a plain identifier or rejected outright.
+
+test('assertSafeIdentifier: a plain name passes', () => {
+  assert.doesNotThrow(() => assertSafeIdentifier('MyDatabase', 'database'));
+});
+
+test('assertSafeIdentifier: undefined/null pass (optional value)', () => {
+  assert.doesNotThrow(() => assertSafeIdentifier(undefined, 'database'));
+  assert.doesNotThrow(() => assertSafeIdentifier(null, 'database'));
+});
+
+test('assertSafeIdentifier: a connection-string injection attempt is rejected', () => {
+  assert.throws(() => assertSafeIdentifier('master;Server=attacker,1433', 'database'), /Invalid database/);
+});
+
+test('assertSafeIdentifier: a semicolon alone is rejected', () => {
+  assert.throws(() => assertSafeIdentifier('master;', 'database'));
 });

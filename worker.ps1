@@ -11,6 +11,7 @@ $sources = @{}
 foreach ($s in $sourceList) { $sources[$s.id] = $s }
 
 $connections = @{}
+$safeIdentifier = '^[A-Za-z0-9_$#@]+$'
 
 function Get-Conn($envName, $db) {
   $src = $sources[$envName]
@@ -18,6 +19,13 @@ function Get-Conn($envName, $db) {
   $server = if ($src.instanceName) { "$($src.host)\$($src.instanceName)" } else { $src.host }
   $dbName = if ($db) { $db } else { $src.database }
   if (-not $dbName) { $dbName = 'master' }
+  # $dbName is interpolated straight into the connection string below (no
+  # bound parameters here); a value like 'master;Server=attacker,1433' would
+  # override Server= and redirect the integrated-auth handshake. The MCP
+  # server validates this already - this is a second, independent check.
+  if ($dbName -notmatch $safeIdentifier) {
+    throw "Invalid database name '$dbName': must contain only letters, digits, or _ `$ # @"
+  }
   $key = "$envName|$dbName"
   if ($connections.ContainsKey($key) -and $connections[$key].State -eq [System.Data.ConnectionState]::Open) {
     return $connections[$key]

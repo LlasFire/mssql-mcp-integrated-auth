@@ -43,12 +43,27 @@ test('isReadOnly: word-boundary check does not flag a keyword as a substring', (
   assert.equal(isReadOnly("SELECT * FROM Notes WHERE Body LIKE '%dropped%'"), true);
 });
 
-test('isReadOnly: known false positive — mutating keyword as a whole word inside a string literal', () => {
-  // Documented limitation: this is a heuristic, not a real SQL parser, and
-  // it deliberately fails toward over-rejecting rather than under-blocking.
-  // Here "delete" is a whole word inside a string literal, not a real
-  // DELETE statement, but the guard has no way to tell the difference.
-  assert.equal(isReadOnly("SELECT * FROM Notes WHERE Body LIKE '%please delete this%'"), false);
+test('isReadOnly: mutating keyword as a whole word inside a string literal is not a false positive', () => {
+  // "delete" is a whole word here, but it's inside a string literal, not a
+  // real DELETE statement. stripStringLiterals() blanks the literal out
+  // before the keyword scan, so this no longer gets rejected.
+  assert.equal(isReadOnly("SELECT * FROM Notes WHERE Body LIKE '%please delete this%'"), true);
+});
+
+test('isSingleStatement: a semicolon inside a string literal is not a false positive', () => {
+  assert.equal(isSingleStatement("SELECT * FROM Notes WHERE Body = 'a;b'"), true);
+});
+
+test('isReadOnly: OPENROWSET is rejected even though it is syntactically a SELECT', () => {
+  assert.equal(isReadOnly("SELECT * FROM OPENROWSET(BULK 'C:\\secret.txt', SINGLE_CLOB) AS x"), false);
+});
+
+test('isReadOnly: OPENQUERY is rejected even though it is syntactically a SELECT', () => {
+  assert.equal(isReadOnly("SELECT * FROM OPENQUERY(LinkedServer, 'SELECT 1')"), false);
+});
+
+test('isReadOnly: OPENDATASOURCE is rejected even though it is syntactically a SELECT', () => {
+  assert.equal(isReadOnly("SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Server=x;').db.dbo.t"), false);
 });
 
 test('assertReadOnly: allows a plain SELECT', () => {
