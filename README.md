@@ -199,8 +199,9 @@ login/access-denied error from SQL Server means situation 2.
 
 ## Tools
 
-Three groups: list objects, inspect one object deeply, or run your own
-read-only query once you know the shape of the data.
+Four groups: list objects, inspect one object deeply, run your own
+read-only query once you know the shape of the data, or execute a stored
+procedure (the one tool here that isn't read-only).
 
 | Tool | Arguments | Notes |
 |---|---|---|
@@ -216,6 +217,7 @@ read-only query once you know the shape of the data.
 | `describe_function` | `env`, `name`, `database?`, `schema?` | Parameters and the full `CREATE FUNCTION` body. |
 | `describe_trigger` | `env`, `trigger`, `database?` | The full trigger body, its table, and INSTEAD OF/disabled flags. |
 | `run_query` | `env`, `sql`, `database?`, `maxRows?` | Ad hoc read-only queries. Write the T-SQL yourself once the tools above have told you what's there; see Safety below. |
+| `execute_procedure` | `env`, `name`, `database?`, `schema?`, `params?` | Runs a stored procedure and returns its first result set. `params` values can be an array for a table-valued parameter. **Not read-only** - see Safety below. |
 
 `describe_procedure` and `describe_function` come back with an empty
 `definition` field if the object is encrypted (`WITH ENCRYPTION`) or you
@@ -235,7 +237,8 @@ explains, and runs a query for you; instead, the `list_*`/`describe_*`
 tools give an MCP client (Claude, or anything else) enough context about
 the real schema to write correct T-SQL itself, and `run_query` is what
 actually executes it, read-only, with the same safety rules as everything
-else here.
+else here. `execute_procedure` is the one exception to "everything here is
+read-only" - see Safety below before reaching for it.
 
 ## Safety
 
@@ -256,6 +259,42 @@ else here.
   real write access or need to relax this, do it deliberately by editing
   `assertReadOnly()` in `lib/guards.mjs`, and prefer granting a read-only
   SQL/Windows login on the server side over loosening this check.
+- `execute_procedure` is not covered by any of the above: it builds a plain
+  `EXEC [schema].[name] @p1 = ..., @p2 = ...` and sends it straight to
+  `worker.ps1`, bypassing `assertReadOnly()` entirely, because a stored
+  procedure can legitimately need to write. It runs with whatever
+  permissions your Windows account has in that environment - there is no
+  extra sandboxing on top of that. Only input parameters are supported (no
+  `OUTPUT`/return value), and only the procedure's first result set comes
+  back (the worker never calls `SqlDataReader.NextResult()`). Procedure/
+  schema names go through `bracketIdentifier()` and parameter values through
+  `sqlValueLiteral()` in `lib/sql-identifiers.mjs` - separate from
+  `sqlLiteral()`/`optionalEqualsClause()` because a callable name isn't a
+  WHERE-clause literal, and a parameter can be a number/boolean/null, not
+  just a string. See `test/procedure-exec.test.mjs`.
+- A table-valued parameter (a parameter whose type is a user-defined table
+  type, e.g. `@GROUP_NAMES AUTHZ.STRING250`) can't be passed as a literal -
+  T-SQL has no TVP literal syntax in a textual `EXEC` call. Pass an array
+  instead (a flat array of scalars for a single-column type, or an array of
+  objects keyed by column name for a multi-column one); `execute_procedure`
+  looks up the parameter's real schema-qualified type name and column list
+  from `sys.parameters`/`sys.table_types`/`sys.columns`
+  (`buildTvpMetadataSql()` in `lib/procedure-exec.mjs`) and builds
+  `DECLARE @x <type>; INSERT INTO @x (...) VALUES (...); EXEC ... @x = @x`
+  as one batch - you don't need to know the type name ahead of time. If the
+  parameter name doesn't match an actual table-valued parameter on that
+  procedure, the error says so and points at `describe_procedure`.
+- If the account lacks `EXECUTE` permission on the procedure,
+  `execute_procedure`'s error says so explicitly (matched on SQL Server's
+  real error-229 wording, see `lib/sql-errors.mjs`) and suggests the
+  fallback: read the procedure with `describe_procedure`, and if the person
+  still wants the same result, propose rewriting its logic as a plain
+  `SELECT` with their parameter values substituted in and running that via
+  `run_query` - only for procedures that just read, only if the account has
+  `SELECT` on the underlying tables, and only as something the person
+  confirms first. A hand-rewritten query is not guaranteed to match the
+  procedure's real logic, so this is a proposal to make, not a silent
+  substitution to perform.
 - Every `list_*`/`describe_*` tool builds its SQL by interpolating your
   arguments (a schema, table, or procedure name) into a query string,
   since the PowerShell worker executes a full T-SQL batch by text and has
@@ -278,17 +317,18 @@ else here.
   `mssql-server.mjs`'s zod schema and again in `worker.ps1` itself.
 - Results are capped at 200 rows by default, 2000 rows maximum
   (`maxRows` argument), with a `truncated` flag in the response.
-- Every `run_query` call (success or failure) is appended to
-  `query-log.jsonl` next to the server: timestamp, environment, database,
-  the SQL text, row count or error, and duration. That file is gitignored;
-  treat it as local audit history, not something to commit or share as-is.
+- Every `run_query` or `execute_procedure` call (success or failure) is
+  appended to `query-log.jsonl` next to the server: timestamp, environment,
+  database, the SQL text, row count or error, and duration. That file is
+  gitignored; treat it as local audit history, not something to commit or
+  share as-is.
 
 ## Testing
 
 There are two tiers, because only one of them can run without a real SQL
 Server behind it:
 
-1. **Unit tests (`npm test`)** run four files with Node's built-in test
+1. **Unit tests (`npm test`)** run six files with Node's built-in test
    runner, no extra dependencies, no network, no SQL Server:
    - `test/guards.test.mjs` covers the safety guard logic in
      `lib/guards.mjs` (`isSingleStatement`, `isReadOnly`, `assertReadOnly`,
@@ -297,35 +337,52 @@ Server behind it:
      `lib/json-utils.mjs`, including the exact BOM-in-`sources.json` case
      that setup.ps1 (see Quick install) writes around.
    - `test/sql-identifiers.test.mjs` covers the escaping helpers in
-     `lib/sql-identifiers.mjs`, including a real SQL-injection string to
-     confirm it comes out as one inert literal.
+     `lib/sql-identifiers.mjs` - `sqlLiteral`/`optionalEqualsClause`
+     (including a real SQL-injection string, to confirm it comes out as
+     one inert literal), `assertSafeIdentifier` (the `database` connection-
+     string guard), and `bracketIdentifier`/`sqlValueLiteral` (used by
+     `execute_procedure`).
    - `test/schema-queries.test.mjs` covers every SQL-text builder in
      `lib/schema-queries.mjs` (the `list_*`/`describe_*` tools): that
      optional filters are appended correctly, that `list_tables` actually
      excludes views now, and that a malicious schema/table/procedure name
      comes out escaped in the generated SQL rather than raw.
+   - `test/procedure-exec.test.mjs` covers `lib/procedure-exec.mjs`:
+     `buildExecProcedureSql()`'s schema/name bracket-quoting, parameter
+     rendering for every supported scalar type, that an unsafe parameter
+     name is rejected rather than interpolated, table-valued-parameter
+     rendering (single- and multi-column, empty array, mismatched
+     metadata), `buildTvpMetadataSql()`'s escaping, and `groupTvpMetadata()`.
+   - `test/sql-errors.test.mjs` covers `isExecutePermissionDenied()` in
+     `lib/sql-errors.mjs`, the classifier `execute_procedure` uses to
+     decide when to append its permission-denied fallback guidance.
 
    These run in CI (`.github/workflows/test.yml`, on `windows-latest`) on
    every push and pull request. This is what actually protects
-   `run_query` and the schema tools: if someone loosens the read-only
-   check or drops the escaping, a test should fail before it ships.
+   `run_query`, `execute_procedure`, and the schema tools: if someone
+   loosens the read-only check or drops the escaping, a test should fail
+   before it ships.
 
-   `npm test` lists each test file explicitly
-   (`node --test test/guards.test.mjs test/sql-identifiers.test.mjs
-   test/schema-queries.test.mjs test/json-utils.test.mjs`) rather than a
-   directory glob, because
-   Node's test runner auto-discovers any file matching `*.test.mjs` or
-   `*-test.mjs` on its own; a bare `node --test` would otherwise also
-   pick up `scripts/smoke-check.mjs` if it were named `smoke-test.mjs`.
-   If you add a new test file under `test/`, add it to this script too.
+   `npm test` lists each test file explicitly rather than a directory
+   glob, because Node's test runner auto-discovers any file matching
+   `*.test.mjs` or `*-test.mjs` on its own; a bare `node --test` would
+   otherwise also pick up `scripts/smoke-check.mjs` if it were named
+   `smoke-test.mjs`. If you add a new test file under `test/`, add it to
+   this script too.
 
 2. **Smoke test (`npm run smoke-test`, runs `scripts/smoke-check.mjs`)**
    is a manual, local, end-to-end check. It spawns the real server,
    performs the actual MCP `initialize` handshake over stdio (not a
-   shortcut), then calls `list_environments` and `list_databases` against
-   a real environment. Run it yourself after `sources.json` is set up,
-   and again after touching `worker.ps1` or the connection-handling code
-   in `mssql-server.mjs`, since that's the part unit tests can't reach.
+   shortcut), checks the `usage-guide` resource, then calls
+   `list_environments` and `list_databases` against a real environment.
+   Run it yourself after `sources.json` is set up, and again after
+   touching `worker.ps1` or the connection-handling code in
+   `mssql-server.mjs`, since that's the part unit tests can't reach.
+   It does not call `execute_procedure` - there's no procedure in
+   `sources.example.json`'s placeholder environments that would be safe
+   to run unconditionally, so that tool is exercised by
+   `test/procedure-exec.test.mjs` (the SQL it builds) and manually against
+   a real, disposable procedure if you're changing it.
    (It's named `smoke-check.mjs` rather than `smoke-test.mjs` on purpose:
    Node's test runner auto-discovers any `*-test.mjs` file by default, and
    this script needs a live SQL Server, so it must never run by accident

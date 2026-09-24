@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { escapeSqlLiteral, sqlLiteral, optionalEqualsClause, assertSafeIdentifier } from '../lib/sql-identifiers.mjs';
+import {
+  escapeSqlLiteral,
+  sqlLiteral,
+  optionalEqualsClause,
+  assertSafeIdentifier,
+  bracketIdentifier,
+  sqlValueLiteral,
+} from '../lib/sql-identifiers.mjs';
 
 // --- escapeSqlLiteral -------------------------------------------------------
 
@@ -96,4 +103,55 @@ test('assertSafeIdentifier: a connection-string injection attempt is rejected', 
 
 test('assertSafeIdentifier: a semicolon alone is rejected', () => {
   assert.throws(() => assertSafeIdentifier('master;', 'database'));
+});
+
+// --- bracketIdentifier ---------------------------------------------------
+// Used for EXEC [schema].[name] in execute_procedure, where the value is
+// the callable object itself, not a WHERE-clause literal - sqlLiteral's
+// quoting doesn't apply here.
+
+test('bracketIdentifier: a plain name is wrapped in brackets', () => {
+  assert.equal(bracketIdentifier('dbo'), '[dbo]');
+});
+
+test('bracketIdentifier: an embedded closing bracket is doubled, not left to close early', () => {
+  // Unescaped, "Weird]Proc" would close the identifier after "Weird",
+  // leaving "Proc]" as trailing SQL text instead of part of the name.
+  assert.equal(bracketIdentifier('Weird]Proc'), '[Weird]]Proc]');
+});
+
+test('bracketIdentifier: rejects non-string input', () => {
+  assert.throws(() => bracketIdentifier(42), TypeError);
+});
+
+// --- sqlValueLiteral -------------------------------------------------------
+// Used for @param = <value> in execute_procedure, where the value can be
+// any JSON scalar, not just a string.
+
+test('sqlValueLiteral: null becomes the NULL keyword, not the string "null"', () => {
+  assert.equal(sqlValueLiteral(null), 'NULL');
+});
+
+test('sqlValueLiteral: true/false become 1/0', () => {
+  assert.equal(sqlValueLiteral(true), '1');
+  assert.equal(sqlValueLiteral(false), '0');
+});
+
+test('sqlValueLiteral: a number is rendered as bare text', () => {
+  assert.equal(sqlValueLiteral(42), '42');
+  assert.equal(sqlValueLiteral(-1.5), '-1.5');
+});
+
+test('sqlValueLiteral: rejects non-finite numbers', () => {
+  assert.throws(() => sqlValueLiteral(NaN), TypeError);
+  assert.throws(() => sqlValueLiteral(Infinity), TypeError);
+});
+
+test('sqlValueLiteral: a string goes through sqlLiteral escaping', () => {
+  assert.equal(sqlValueLiteral("O'Brien"), "'O''Brien'");
+});
+
+test('sqlValueLiteral: rejects a value of an unsupported type (object/array)', () => {
+  assert.throws(() => sqlValueLiteral({}), TypeError);
+  assert.throws(() => sqlValueLiteral([1, 2]), TypeError);
 });
